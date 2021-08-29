@@ -1,0 +1,81 @@
+---
+title: "tdm"
+output: html_document
+---
+
+```{r, message=FALSE}
+library(tidyverse)
+library(jiebaR)
+library(tidyfst)
+library(tidytext)
+library(word2vec)
+library(text2vec)
+library(Rwordseg)
+```
+
+```{r}
+# 读入数据
+news <- read_csv("news_result(20210514).csv", locale = locale(encoding = "GBK"))
+news <- news %>% select(-X1)
+news %>% head()
+```
+
+```{r}
+# 初始化分词引擎
+wk <- worker(stop_word = "stopwordsCN.txt")
+```
+
+
+```{r}
+# 分词
+news_tidy <- news %>% 
+  mutate_dt(word = lapply(content, segment, wk)) %>% 
+  unnest_dt(word) %>% 
+  mutate_dt(len = str_length(word)) %>% 
+  filter(len >= 2) %>% 
+  select(-c(content, len))
+news_tidy
+```
+
+# Bag of Words
+
+```{r}
+# 计算tf-idf
+news_tidy_tf_idf <- news_tidy %>% 
+  count(date, word) %>% 
+  bind_tf_idf(document = date, term = word, n = n)
+news_tidy_tf_idf
+```
+
+```{r}
+# 转化为dtm
+news_dfm <- news_tidy_tf_idf %>% 
+  cast_dfm(document = date, term = word, value = tf_idf)
+news_dfm
+```
+
+# word2vec
+
+```{r}
+# 计算一段文本
+content_1 <- news$content[1]
+wk <- worker(stop_word = "stopwordsCN.txt")
+content_1_segment <- segment(content_1, jiebar = wk)
+content_1_segment[1:10]
+w2v_model <- word2vec(x = content_1_segment, threads = 12)
+w2v_model_mat <- as.matrix(w2v_model)
+w2v_model_mat %>% head()
+```
+
+```{r}
+# 计算多段文本
+content <- news$content
+wk <- worker(stop_word = "stopwordsCN.txt")
+content_segment <- sapply(content, segmentCN, analyzer = "jiebaR", jiebar = wk, returnType = "tm", USE.NAMES = FALSE)
+content_segment[1:2]
+# content_segment <- content_segment %>% unlist()
+w2v_model <- word2vec(x = content_segment, threads = 12)
+w2v_model_mat <- as.matrix(w2v_model)
+w2v_model_mat %>% head()
+```
+
