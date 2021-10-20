@@ -1,0 +1,255 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+语言缩写：https://en.wikipedia.org/wiki/ISO_639-1
+停用词库：https://github.com/quanteda/stopwords
+
+```{r}
+library(stopwords)
+```
+
+```{r}
+stopwords_getsources()
+```
+
+
+
+```{r}
+# 中文停用词
+head(stopwords("zh", source = "misc"))
+head(stopwords("zh", source = "stopwords-iso"))
+length(stopwords("zh", source = "misc"))
+length(stopwords("zh", source = "stopwords-iso"))
+```
+
+```{r}
+library(tidyverse)
+library(tidytext)
+library(SnowballC)
+```
+
+```{r}
+complaints <- read_csv("complaints.csv")
+complaints
+```
+
+```{r}
+print(object.size(complaints), units = "GB")
+```
+
+```{r}
+complaints <- complaints %>%
+  filter(`Date received` > "2021-01-01") %>% 
+  drop_na(`Consumer complaint narrative`) %>% 
+  select(`Complaint ID`, `Consumer complaint narrative`)
+complaints
+```
+
+
+```{r}
+print(object.size(complaints), units = "GB")
+```
+
+
+```{r}
+# 稀疏矩阵
+complaints %>%
+  unnest_tokens(output = word, input = `Consumer complaint narrative`) %>%
+  anti_join(get_stopwords(), by = "word") %>%
+  mutate(stem = wordStem(word)) %>%
+  count(`Complaint ID`, stem) %>%
+  cast_dfm(`Complaint ID`, stem, n)
+```
+
+
+```{r}
+# tf-idf稀疏矩阵
+complaints %>%
+  unnest_tokens(output = word, input = `Consumer complaint narrative`) %>%
+  anti_join(get_stopwords(), by = "word") %>%
+  mutate(stem = wordStem(word)) %>%
+  count(`Complaint ID`, stem) %>%
+  bind_tf_idf(stem, `Complaint ID`, n) %>%
+  cast_dfm(`Complaint ID`, stem, tf_idf)
+```
+
+
+```{r}
+# 整洁化
+tidy_complaints <- complaints %>%
+  unnest_tokens(word, `Consumer complaint narrative`) %>%
+  add_count(word) %>%
+  filter(n >= 50) %>%
+  select(-n)
+
+nested_words <- tidy_complaints %>%
+  nest(words = c(word))
+
+nested_words
+```
+
+
+```{r}
+library(slider)
+library(tidyverse)
+library(widyr)
+library(furrr)
+library(tictoc)
+```
+
+
+```{r}
+slide_windows <- function(tbl, window_size) {
+  skipgrams <- slider::slide(
+    tbl, 
+    ~.x, 
+    .after = window_size - 1, 
+    .step = 1, 
+    .complete = TRUE
+  )
+  
+  safe_mutate <- safely(mutate)
+  
+  out <- map2(skipgrams,
+              1:length(skipgrams),
+              ~ safe_mutate(.x, window_id = .y))
+
+  out %>%
+    transpose() %>%
+    pluck("result") %>%
+    compact() %>%
+    bind_rows()
+}
+```
+
+
+```{r}
+# 计算pmi，计算时间太久
+# plan(multisession)  ## for parallel processing
+# tic()
+# tidy_pmi <- nested_words %>%
+#   mutate(words = future_map(words, slide_windows, 4L)) %>%
+#   unnest(words) %>%
+#   unite(window_id, `Complaint ID`, window_id) %>%
+#   pairwise_pmi(word, window_id)
+# toc()
+# plan(sequential)
+# 
+# tidy_pmi
+```
+
+
+```{r}
+# 奇异值分解
+# tidy_word_vectors <- tidy_pmi %>%
+#   widely_svd(
+#     item1, item2, pmi,
+#     nv = 100, maxit = 1000
+#   )
+# 
+# tidy_word_vectors
+```
+
+
+```{r}
+library(textdata)
+library(widyr)
+```
+
+
+```{r}
+glove6b <- embedding_glove6b(dimensions = 100)
+glove6b
+```
+
+```{r}
+tidy_glove <- glove6b %>%
+  pivot_longer(contains("d"),
+               names_to = "dimension") %>%
+  rename(item1 = token)
+
+tidy_glove
+```
+
+
+```{r}
+nearest_neighbors <- function(df, token) {
+  df %>%
+    widely(
+      ~ {
+        y <- .[rep(token, nrow(.)), ]
+        res <- rowSums(. * y) / 
+          (sqrt(rowSums(. ^ 2)) * sqrt(sum(.[token, ] ^ 2)))
+        matrix(res, ncol = 1, dimnames = list(x = names(res)))
+        },
+      sort = TRUE,
+      maximum_size = NULL
+    )(item1, dimension, value) %>%
+    select(-item2)
+}
+```
+
+
+```{r}
+tidy_glove %>%
+    nearest_neighbors("error")
+```
+
+# 回归模型
+
+```{r}
+library(tidyverse)
+library(scotus)
+library(tidymodels)
+library(textrecipes)
+```
+
+
+```{r}
+scotus_filtered %>%
+  as_tibble()
+```
+
+
+# textrecipes官网：https://textrecipes.tidymodels.org/index.html
+
+```{r}
+set.seed(1234)
+scotus_split <- scotus_filtered %>%
+  mutate(year = as.numeric(year),
+         text = str_remove_all(text, "'")) %>%
+  initial_split()
+scotus_train <- training(scotus_split)
+scotus_test <- testing(scotus_split)
+```
+
+
+```{r}
+scotus_rec <- recipe(year ~ text, data = scotus_train) %>%
+  step_tokenize(text) %>%
+  step_tokenfilter(text, max_tokens = 1e3) %>%
+  step_tfidf(text) %>%
+  step_normalize(all_predictors())
+
+scotus_rec
+```
+
+```{r}
+scotus_prep <- prep(scotus_rec)
+scotus_bake <- bake(scotus_prep, new_data = NULL)
+```
+
+
+```{r}
+scotus_bake
+```
+
+```{r}
+recipe(year ~ text, data = scotus_train) %>%
+  step_tokenize(text) %>%
+  show_tokens()
+```
+
+

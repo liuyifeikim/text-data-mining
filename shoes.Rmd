@@ -1,0 +1,234 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r}
+library(tidymodels)
+library(textrecipes)
+library(tidyverse)
+library(jiebaR)
+library(stopwords)
+library(LiblineaR)
+tidymodels_prefer()
+```
+
+# textrecipes官网：https://textrecipes.tidymodels.org/index.html
+
+```{r}
+shoes <- read_csv("shoe_result.csv", locale = locale(encoding = "GBK"), col_names = TRUE)
+shoes <- shoes %>% 
+  select(price, comments) %>% 
+  drop_na() %>% 
+  filter(price > 0)
+shoes
+```
+
+
+```{r}
+# 数据划分
+set.seed(100)
+shoes_split <- initial_split(shoes)
+shoes_train <- training(shoes_split)
+shoes_test <- testing(shoes_split)
+dim(shoes_train)
+dim(shoes_test)
+```
+
+```{r}
+# 看分词结果
+recipe(price ~ comments, data = shoes_train) %>%
+  step_tokenize(comments) %>% 
+  show_tokens(comments) %>% 
+  .[1:3]
+```
+
+```{r}
+# 停用词词典
+stopwordsCN <- read.table("stopwordsCN.txt", encoding = "UTF-8")
+stopwordsCN
+stopwordsCN <- stopwordsCN %>% pull()
+stopwordsCN[1:10]
+
+stopwords_zh_misc <- stopwords("zh", source = "misc")
+stopwords_zh_misc[1:10]
+
+stopwords_zh_iso <- stopwords("zh", source = "stopwords-iso")
+stopwords_zh_iso[1:10]
+
+stopwords_all <- union_all(stopwords_zh_misc, stopwords_zh_iso)
+stopwords_all <- union_all(stopwords_all, stopwordsCN)
+
+length(stopwordsCN)
+length(stopwords_zh_misc)
+length(stopwords_zh_iso)
+length(stopwords_all)
+
+stopwords_all_df <- as.data.frame(stopwords_all)
+stopwords_all_df
+
+# write.table(stopwords_all_df, "stopwords_all.txt", row.names = FALSE, col.names = FALSE, quote = FALSE, fileEncoding = "UTF-8")
+```
+
+
+```{r}
+# 自定义中文分词引擎
+jieba_worker <- worker(stop_word = "stopwords_all.txt", bylines = TRUE, symbol = FALSE) # 要以列表形式输出
+jieba_tokenizer <- function(x){
+  segment(x, jiebar = jieba_worker)
+}
+```
+
+
+```{r}
+# 预处理流程
+shoes_rec <- recipe(price ~ comments, data = shoes_train) %>%
+  step_tokenize(comments, custom_token = jieba_tokenizer) %>% 
+  step_tokenfilter(comments, min_times = 2) %>%  # 建议先过滤减少词汇后再计算后续的指标，至少出现过2次
+  step_stopwords(comments, custom_stopword_source = stopwords_all) %>% 
+  step_stopwords(comments, custom_stopword_source = c(1:9)) %>% 
+  step_tfidf(comments, smooth_idf = TRUE, norm = "l2") %>%  # 避免idf = 0
+  step_normalize(all_predictors())
+# 
+# shoes_prep <- prep(shoes_rec)
+# shoes_bake <- bake(shoes_prep, new_data = NULL)
+# shoes_bake
+```
+
+# 回归模型方法：https://smltar.com/mlregression.html#firstmlregression
+
+```{r}
+show_engines("svm_linear")
+```
+
+```{r}
+svm_spec <- svm_linear() %>%
+  set_mode("regression") %>%
+  set_engine("LiblineaR")
+```
+
+
+```{r}
+wf_svm <- workflow() %>%
+  add_recipe(shoes_rec) %>% 
+  add_model(svm_spec)
+```
+
+
+```{r}
+wf_svm_fit <- wf_svm %>% fit(shoes_train)
+wf_svm_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  arrange(-estimate)
+```
+
+```{r}
+set.seed(123)
+shoes_folds <- vfold_cv(shoes_train)
+shoes_folds
+```
+
+```{r}
+set.seed(123)
+wf_svm_cv <- wf_svm %>% 
+  fit_resamples(
+  shoes_folds,
+  control = control_resamples(save_pred = TRUE)
+)
+wf_svm_cv %>% collect_metrics()
+```
+
+```{r}
+wf_svm_cv %>%
+  collect_predictions() %>%
+  ggplot(aes(price, .pred, color = id)) +
+  geom_abline(lty = 2, color = "gray80", size = 1.5) +
+  geom_point(alpha = 0.3) +
+  labs(
+    x = "Truth",
+    y = "Predicted price",
+    color = NULL,
+    title = "Predicted and true price for shoes",
+    subtitle = "Each cross-validation fold is shown in a different color"
+  )
+```
+
+```{r}
+# 空模型，用于比较
+null_spec <- null_model() %>%
+  set_engine("parsnip") %>%
+  set_mode("regression")
+```
+
+
+```{r}
+wf_null_cv <- wf_svm %>% 
+  update_model(null_spec) %>% 
+  fit_resamples(
+    shoes_folds,
+    control = control_resamples(save_pred = TRUE))
+```
+
+```{r}
+wf_null_cv %>% collect_metrics()
+```
+
+```{r}
+rf_spec <- rand_forest(trees = 1000) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+```
+
+```{r}
+wf_rf_cv <- wf_svm %>% 
+  update_model(rf_spec) %>% 
+  fit_resamples(
+    shoes_folds,
+    control = control_resamples(save_pred = TRUE))
+wf_rf_cv %>% collect_metrics()
+```
+
+```{r}
+wf_rf_cv %>% collect_predictions() %>%
+  ggplot(aes(price, .pred, color = id)) +
+  geom_abline(lty = 2, color = "gray80", size = 1.5) +
+  geom_point(alpha = 0.3) +
+  labs(
+    x = "Truth",
+    y = "Predicted price",
+    color = NULL,
+    title = paste("Predicted and true price for shoes",
+                  "a random forest model", sep = "\n"),
+    subtitle = "Each cross-validation fold is shown in a different color"
+  )
+```
+
+```{r}
+ngram_rec <- function(ngram_options) {
+  recipe(price ~ comments, data = shoes_train) %>%
+    step_tokenize(comments, custom_token = jieba_tokenizer, token = "ngrams", options = ngram_options) %>%
+    step_tokenfilter(comments, min_times = 2) %>%
+    step_stopwords(comments, custom_stopword_source = c(stopwords_all, c(1:9))) %>% 
+    step_tfidf(comments, smooth_idf = TRUE, norm = "l2") %>%  
+    step_normalize(all_predictors())
+}
+```
+
+
+```{r}
+fit_ngram <- function(ngram_options) {
+  fit_resamples(
+    wf_svm %>% update_recipe(ngram_rec(ngram_options)),
+    shoes_folds
+  )
+}
+```
+
+
+```{r}
+set.seed(345)
+trigram_cv <- fit_ngram(list(3))
+trigram_cv %>% collect_metrics()
+```
+
