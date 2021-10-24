@@ -10,14 +10,18 @@ library(tidyverse)
 library(jiebaR)
 library(stopwords)
 library(LiblineaR)
+library(tensorflow)
+library(keras)
+library(fastTextR)
 tidymodels_prefer()
 ```
 
 # textrecipes官网：https://textrecipes.tidymodels.org/index.html
 
 ```{r}
-shoes <- read_csv("shoe_result.csv", locale = locale(encoding = "GBK"), col_names = TRUE)
-shoes <- shoes %>% 
+shoes_origin <- read_csv("shoe_result.csv", locale = locale(encoding = "GBK"), col_names = TRUE)
+shoes_origin
+shoes <- shoes_origin %>% 
   select(price, comments) %>% 
   drop_na() %>% 
   filter(price > 0)
@@ -209,7 +213,7 @@ ngram_rec <- function(ngram_options) {
   recipe(price ~ comments, data = shoes_train) %>%
     step_tokenize(comments, custom_token = jieba_tokenizer, token = "ngrams", options = ngram_options) %>%
     step_tokenfilter(comments, min_times = 2) %>%
-    step_stopwords(comments, custom_stopword_source = c(stopwords_all, c(1:9))) %>% 
+    step_stopwords(comments, custom_stopword_source = c(stopwords_all, c(0:9))) %>% 
     step_tfidf(comments, smooth_idf = TRUE, norm = "l2") %>%  
     step_normalize(all_predictors())
 }
@@ -230,5 +234,253 @@ fit_ngram <- function(ngram_options) {
 set.seed(345)
 trigram_cv <- fit_ngram(list(3))
 trigram_cv %>% collect_metrics()
+```
+
+# keras安装:
+https://tensorflow.rstudio.com/installation/
+https://tensorflow.rstudio.com/guide/keras/
+
+```{r}
+# install.packages("tensorflow")
+# library(tensorflow)
+# install_tensorflow()
+# install.packages("keras")
+# library(keras)
+```
+
+
+```{r}
+# 自定义中文分词引擎
+jieba_worker <- worker(stop_word = "stopwords_all.txt", bylines = TRUE, symbol = FALSE) # 要以列表形式输出
+jieba_tokenizer <- function(x){
+  segment(x, jiebar = jieba_worker)
+}
+```
+
+```{r}
+shoes_classify <- shoes_origin %>% 
+  select(price, comments) %>% 
+  drop_na() %>% 
+  filter(price > 0) %>% 
+  mutate(price_yn = if_else(price > 1000, 1, 0)) %>% 
+  select(-price)
+shoes_classify
+shoes_classify %>% count(price_yn)
+```
+
+```{r}
+set.seed(100)
+shoes_classify_split <- initial_split(shoes_classify)
+shoes_classify_train <- training(shoes_classify_split)
+shoes_classify_test <- testing(shoes_classify_split)
+dim(shoes_classify_train)
+dim(shoes_classify_test)
+```
+
+
+```{r}
+max_words <- 1e3
+max_length <- 30
+```
+
+
+```{r}
+# 预处理过程，只处理自变量
+shoes_dl_rec <- recipe(~ comments, data = shoes_train) %>%
+  step_tokenize(comments, custom_token = jieba_tokenizer) %>% 
+  step_tokenfilter(comments, max_tokens = max_words) %>%
+  step_stopwords(comments, custom_stopword_source = c(stopwords_all, c(1:9))) %>% 
+  step_sequence_onehot(comments, sequence_length = max_length, padding = "pre", truncating = "pre") 
+  # 长度不足max_length的文本前面补0，长度大于max_length的文本截断前面的词
+```
+
+
+```{r}
+# 需要在神经网络中输入bake后的数据
+shoes_dl_rec_prep <-  prep(shoes_dl_rec)
+shoes_dl_train <- bake(shoes_dl_rec_prep, new_data = NULL, composition = "matrix")
+dim(shoes_dl_train)
+class(shoes_dl_train)
+```
+
+
+
+```{r}
+dense_model <- keras_model_sequential() %>%
+  layer_embedding(input_dim = max_words + 1,
+                  output_dim = 12,
+                  input_length = max_length) %>%
+  layer_flatten() %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+dense_model
+```
+
+```{r}
+dense_model %>% compile(
+  optimizer = "adam",
+  loss = "binary_crossentropy",
+  metrics = c("accuracy")
+)
+```
+
+
+```{r}
+# 模型训练
+dense_history <- dense_model %>%
+  fit(
+    x = shoes_dl_train,
+    y = shoes_classify_train$price_yn, # 不需要转化为因子
+    batch_size = 512,
+    epochs = 20,
+    validation_split = 0.25,
+    verbose = TRUE
+  )
+```
+
+```{r}
+dense_history
+plot(dense_history)
+```
+
+
+```{r}
+set.seed(234)
+shoes_classify_val <- validation_split(shoes_classify_train, strata = price_yn)
+shoes_classify_val
+```
+
+```{r}
+# 训练集划分为训练集和验证集
+shoes_classify_analysis_bake <- bake(shoes_dl_rec_prep, new_data = analysis(shoes_classify_val$splits[[1]]), composition = "matrix")
+shoes_classify_assess_bake <- bake(shoes_dl_rec_prep, new_data = assessment(shoes_classify_val$splits[[1]]), composition = "matrix")
+dim(shoes_classify_analysis_bake)
+dim(shoes_classify_assess_bake)
+```
+
+```{r}
+# 创建因变量
+price_yn_analysis <- analysis(shoes_classify_val$splits[[1]]) %>% pull(price_yn)
+price_yn_assess <- assessment(shoes_classify_val$splits[[1]]) %>% pull(price_yn)
+```
+
+
+```{r}
+# 使用自定义的验证集
+val_history <- dense_model %>%
+  fit(
+    x = shoes_classify_analysis_bake,
+    y = price_yn_analysis,
+    batch_size = 512,
+    epochs = 10,
+    validation_data = list(shoes_classify_assess_bake, price_yn_assess),
+    verbose = TRUE
+  )
+```
+
+
+```{r}
+val_history
+plot(val_history)
+```
+
+
+```{r}
+keras_predict <- function(model, baked_data, response) {
+  predictions <- predict(model, baked_data)[, 1]
+  tibble(
+    .pred_1 = predictions,
+    .pred_class = if_else(.pred_1 < 0.5, 0, 1),
+    state = response
+  ) %>%
+    mutate(across(c(state, .pred_class),            ## create factors
+                  ~ factor(.x, levels = c(1, 0))))  ## with matching levels
+}
+```
+
+
+```{r}
+val_res <- keras_predict(dense_model, shoes_classify_assess_bake, price_yn_assess)
+val_res
+```
+
+```{r}
+metrics(val_res, state, .pred_class)
+```
+
+```{r}
+val_res %>%
+  roc_curve(truth = state, .pred_1) %>%
+  autoplot() +
+  labs(title = "Receiver operator curve for Kickstarter blurbs")
+```
+
+```{r}
+# 使用词袋
+shoes_dl_bow_rec <- recipe(~ comments, data = shoes_classify_train) %>%
+  step_tokenize(comments, custom_token = jieba_tokenizer) %>%
+  step_stopwords(comments, custom_stopword_source = c(stopwords_all, c(0:9))) %>%
+  step_tokenfilter(comments, max_tokens = 1e3) %>%
+  step_tf(comments)
+```
+
+
+```{r}
+shoes_dl_bow_prep <-  prep(shoes_dl_bow_rec)
+shoes_bow_analysis_bake <- bake(shoes_dl_bow_prep, new_data = analysis(shoes_classify_val$splits[[1]]), composition = "matrix")
+shoes_bow_assess_bake <- bake(shoes_dl_bow_prep, new_data = assessment(shoes_classify_val$splits[[1]]), composition = "matrix")
+dim(shoes_bow_analysis_bake)
+dim(shoes_bow_assess_bake)
+```
+
+
+```{r}
+bow_model <- keras_model_sequential() %>%
+  layer_dense(units = 64, activation = "relu", input_shape = c(1e3)) %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+bow_model %>% compile(
+  optimizer = "adam",
+  loss = "binary_crossentropy",
+  metrics = c("accuracy")
+)
+```
+
+
+```{r}
+bow_history <- bow_model %>%
+  fit(
+    x = shoes_bow_analysis_bake,
+    y = price_yn_analysis,
+    batch_size = 512,
+    epochs = 10,
+    validation_data = list(shoes_bow_assess_bake, price_yn_assess),
+    verbose = TRUE
+  )
+```
+
+
+```{r}
+bow_history
+plot(bow_history)
+```
+
+
+```{r}
+bow_res <- keras_predict(bow_model, shoes_bow_assess_bake, price_yn_assess)
+metrics(bow_res, state, .pred_class)
+```
+
+# fastText与训练词向量模型：https://fasttext.cc/docs/en/crawl-vectors.html
+
+```{r}
+cc_zh_300_model <- ft_load("cc.zh.300.bin")
+cc_zh_300_model
+```
+
+```{r}
+ft_nearest_neighbors(cc_zh_300_model, "中国", k = 5)
 ```
 
