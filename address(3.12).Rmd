@@ -1,0 +1,223 @@
+---
+title: "Address_Rwordseg"
+author: "KIM"
+date: "2019/3/3"
+output: html_document
+---
+
+#待解决：
+1、分拆成单字后怎么变成TM格式？
+2、是否可以直接用unnest_token变成矩阵，不用tm格式
+
+
+# 载入库
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tm)
+library(tmcn) # segmentCN
+library(jiebaR)
+library(Rwordseg) # segmentCN的函数
+library(e1071)
+library(caret) 
+library(readxl)
+library(tidytext)
+library(textrecipes)
+library(tidymodels)
+library(stopwords)
+```
+
+# 原始数据读取
+```{r}
+mingxi <- read_xlsx("mingxi.xlsx")
+mingxi
+```
+
+# 数据初步清理
+```{r}
+mingxi_s <- mingxi %>% 
+  filter(`属性`!= "校园") %>% 
+  select(`二级地址(0116)`, `三级地址(0116)`, `四级地址(0116)`, `五级地址(0116)`, `属性`) %>% 
+  rename(two = `二级地址(0116)`,
+         three = `三级地址(0116)`,
+         four = `四级地址(0116)`,
+         five = `五级地址(0116)`,
+         class = `属性`) %>% 
+  unite(address, two, three, four, five, sep = "") %>% 
+  mutate(id = row_number(),
+         class = factor(class),
+         address = str_replace_all(address, "[\\d|\\s|A-Za-z|\\p{P}]", "")) #删除数字、不可见字符、英文字母、标点符号
+mingxi_s
+```
+
+#字典处理
+```{r}
+# dict <- dir("./Dict") #查看文件夹文件
+# dict
+# for (i in 1:length(dict)){
+#   installDict(paste("./Dict/", dict[i], sep = ""), dictname = dict[i], dicttype = "scel", load = T)
+#  }   #循环安装字典
+# listDict()
+```
+
+#转化为每个字一行
+```{r}
+mingxi_s_single <- mingxi_s %>% 
+  select(-class) %>% 
+  unnest_tokens(input = address, output = word, token = "characters") %>% 
+  count(id, word)
+mingxi_s_single
+```
+
+#转化为矩阵
+```{r}
+mingxi_s_dtm <- mingxi_s_single %>% 
+  cast_dtm(document = id, term = word, value = n)
+mingxi_s_dtm
+mingxi_s_mat <- as.matrix(mingxi_s_dtm)
+mingxi_s_mat[1:10, 1:10]
+```
+
+#数据集划分
+```{r}
+set.seed(100)
+train_id <- createDataPartition(mingxi_s$class, p = 0.7)$Resample1
+
+#原始数据
+address_raw_rw_train_3 <- mingxi_s[train_id,]
+address_raw_rw_test_3 <- mingxi_s[-train_id,]
+address_raw_rw_train_3 %>% 
+  count(class) %>% 
+  mutate(total = sum(n),
+         p = round(n / total * 100, 2))
+address_raw_rw_test_3 %>% 
+  count(class) %>% 
+  mutate(total = sum(n),
+         p = round(n / total * 100, 2))
+
+#DTM
+address_dtm_rw_train_3 <- mingxi_s_dtm[train_id,]  
+address_dtm_rw_test_3 <- mingxi_s_dtm[-train_id,]  
+address_dtm_rw_train_3     #documents: 4807, terms: 6255
+address_dtm_rw_test_3      #documents: 2059, terms: 6255
+```
+
+#DTM每一列处理为因子
+```{r}
+count_factor <- function(x){
+  x = if_else(x >= 1, 1, 0)
+  x = factor(x, levels = c(0, 1), labels = c("no" ,"yes"))
+  return(x)
+}
+
+address_rw_train_3 <- apply(address_dtm_rw_train_3, 2, count_factor)
+address_rw_test_3 <- apply(address_dtm_rw_test_3, 2, count_factor)
+
+address_rw_train_3[1:8, 1:8]
+address_rw_test_3[1:8, 1:8]
+```
+
+#模型建立及混淆矩阵 
+```{r}
+nb_model_rw_3 <- naiveBayes(address_rw_train_3, address_raw_rw_train_3$class, laplace = 1)
+y_pred_rw_3 <- predict(nb_model_rw_3, address_rw_test_3) #输出类别
+y_pred_rw_prod_3 <- predict(nb_model_rw_3, address_rw_test_3, type = "raw") #输出类别
+confusionMatrix(y_pred_rw_3, address_raw_rw_test_3$class, mode = "prec_recall", positive = "社区")
+confusionMatrix(y_pred_rw_3, address_raw_rw_test_3$class, mode = "prec_recall", positive = "村")
+```
+
+# 使用tidymodels进行建模
+
+```{r}
+# 划分数据集
+set.seed(100)
+mingxi_s_split <- initial_split(mingxi_s, prop = 0.80, strata = class)
+mingxi_s_train <- training(mingxi_s_split)
+mingxi_s_test  <-  testing(mingxi_s_split)
+mingxi_s_train
+mingxi_s_test
+```
+
+# 分单字
+
+```{r}
+# 简写可见：https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
+rec_token_cha <- 
+  recipe(class ~ ., data = mingxi_s_train) %>%
+  update_role(id, new_role = "ID") %>% 
+  step_tokenize(address, token = "characters") %>% 
+  step_stopwords(address, stopword_source = "stopwords-iso", language = "zh")   # 部分stopword_source不支持zh
+tidy(rec_token_cha)
+rec_token_cha %>% prep() %>% bake(new_data = NULL)
+```
+
+```{r}
+# 看分词效果
+recipe(~ address, data = mingxi_s_train) %>%
+  step_tokenize(address, token = "characters") %>% 
+  step_stopwords(address, stopword_source = "stopwords-iso", language = "zh") %>% 
+  show_tokens(address) %>% 
+  .[1:5]
+```
+
+# jieba分词
+
+```{r}
+jieba_worker  <-  worker(bylines = TRUE) # 结果为一个列表
+mingxi_s_train %>% 
+  mutate(address_seg_1 = segmentCN(address, analyzer = "jiebaR"), 
+         address_seg_2 = segment(address, jieba_worker))
+```
+
+
+```{r}
+# 设定分词引擎
+jieba_tokenizer <- function(x) {
+  jieba_worker = worker(
+    bylines = TRUE, 
+    stop_word = "D:/K/DATA EXERCISE/R/zhaoqing_address/custom_dict/Rwordseg/stopwordsCN.txt", 
+    dict = "D:/K/DATA EXERCISE/R/zhaoqing_address/custom_dict/Rwordseg/user.dic"
+    ) # 结果为列表
+  segment(x, jiebar = jieba_worker)
+}
+
+# 使用自定义分词引擎
+rec_token_jb <- 
+  recipe(class ~ ., data = mingxi_s_train) %>%
+  update_role(id, new_role = "ID") %>% 
+  step_tokenize(address, custom_token = jieba_tokenizer) %>% 
+  step_stopwords(address, stopword_source = "stopwords-iso", language = "zh") %>% 
+  step_tokenfilter(address, min_times = 2)
+tidy(rec_token_jb)
+rec_token_jb %>% prep() %>% bake(new_data = NULL)
+# rec_token_jb %>% prep() %>% bake(new_data = mingxi_s_test)
+```
+
+```{r}
+recipe(~ address, data = mingxi_s_train) %>%
+  step_tokenize(address, custom_token = jieba_tokenizer) %>%
+  step_stopwords(address, stopword_source = "stopwords-iso", language = "zh") %>% 
+  step_tokenfilter(address, min_times = 2) %>% 
+  show_tokens(address) %>% 
+  .[1:5]
+```
+
+```{r}
+# 分词器要返回一个列表
+space_tokenizer <- function(x) {
+  strsplit(x, " +")
+}
+space_tokenizer("Sometimes you need to perform tokenization")
+class(space_tokenizer("Sometimes you need to perform tokenization"))
+```
+
+```{r}
+x <- "花都区花山镇省道福源村"
+jieba_worker <- worker(bylines = TRUE)
+x_seg <- segment(x, jiebar = jieba_worker)
+x_seg
+class(x_seg)
+tokenlist(x_seg)
+```
+
+
+
