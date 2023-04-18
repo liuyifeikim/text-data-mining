@@ -1,0 +1,143 @@
+---
+title: "Address_tidymodels"
+author: "KIM"
+date: "2019/3/3"
+output: html_document
+---
+
+# 载入库
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(jiebaR)
+library(Rwordseg) # segmentCN的函数
+library(readxl)
+library(tidytext)
+library(textrecipes)
+library(tidymodels)
+```
+
+# 原始数据读取
+```{r}
+mingxi <- read_xlsx("mingxi.xlsx")
+mingxi
+```
+
+# 数据初步清理
+```{r}
+remove_str <- "[(待删除)|(仅限续费)|(不可报装)|(未验收)|(已光改)|(地址)|(指定渠道下单)|(管道商协议问题)|(物业问题)|(光纤改造中，暂不可下单)]"
+mingxi_s <- 
+mingxi %>% 
+  filter(`属性`!= "校园") %>% 
+  select(two = `二级地址(0116)`, three = `三级地址(0116)`, four = `四级地址(0116)`, five = `五级地址(0116)`, class = `属性`) %>% 
+  unite(address, two, three, four, five, sep = "") %>% 
+  mutate(id = row_number(),
+         class = factor(class),
+         address = str_remove_all(address, "[\\d|\\s|A-Za-z|\\p{P}]")) %>% 
+  mutate(address = str_remove_all(address, remove_str))
+mingxi_s
+```
+
+# 字典处理
+
+在不能使用cidian包的情况下，借助Rwordseg包的installDict函数，将搜狗细胞库转化为txt（dic）格式的词典，将词典放入jieba的worker分词引擎中使用。
+步骤：
+1.在本工作空间中先建立文件夹custom_dict（或其他名称）
+2.将dicmeta, option.rds和user.dic三个文件都放到custom_dict/Rwordseg目录下才能安装成功，user.dic中最少要有1行
+3.使用Rwordseg包的installDict函数字典安装搜狗scel文件，安装后会自动累加写入user.dic文件（如果使用cidian包的decode函数，则每个词典会变为单独的txt）
+4.将user.dic文件放入jieba包的worker()中进行调用。
+
+安裝cidian包的使用方法：https://zhuanlan.zhihu.com/p/473619960
+使用cidian包的情况下，将字典通过decode_scel函数解压成单个txt格式词典，可以人工合并在一起，放入jieba的worker分词引擎中使用。
+```{r}
+# tempdir() 
+# 设置字典文件，要先建立文件夹
+setAppDir("custom_dict") 
+dict <- dir("./Dict", pattern = ".scel$") 
+# 循环安装字典，会累加到user.dic中，user.dic原始文件中至少要有1条数据
+for (i in 1:length(dict)){
+  Rwordseg::installDict(file.path("./Dict", dict[i]))
+  print(sprintf("已完成第%d个词典", i))
+ }   
+listDict()
+```
+
+# 使用tidymodels进行建模
+```{r}
+# 划分数据集
+set.seed(100)
+mingxi_s_split <- initial_split(mingxi_s, prop = 0.80, strata = class)
+mingxi_s_train <- training(mingxi_s_split)
+mingxi_s_test  <-  testing(mingxi_s_split)
+mingxi_s_train
+mingxi_s_test
+```
+
+# 分单字
+
+# jieba分词
+
+```{r}
+jieba_worker  <-  worker(bylines = TRUE) # 结果为一个列表
+mingxi_s_train %>% 
+  mutate(address_seg_1 = segmentCN(address, analyzer = "jiebaR"), 
+         address_seg_2 = segment(address, jieba_worker))
+```
+
+
+```{r}
+# 设定分词引擎
+jieba_tokenizer <- function(x) {
+  jieba_worker = worker(
+    bylines = TRUE, 
+    stop_word = "D:/K/DATA EXERCISE/R/zhaoqing_address/custom_dict/Rwordseg/stopwordsCN.txt", 
+    dict = "D:/K/DATA EXERCISE/R/zhaoqing_address/custom_dict/Rwordseg/user.dic"
+    ) # 结果为列表
+  segment(x, jiebar = jieba_worker)
+}
+
+# 使用自定义分词引擎
+rec_token_jb <- 
+  recipe(class ~ ., data = mingxi_s_train) %>%
+  update_role(id, new_role = "ID") %>% 
+  step_tokenize(address, custom_token = jieba_tokenizer) %>% 
+  step_stopwords(address, stopword_source = "stopwords-iso", language = "zh") %>% 
+  step_tokenfilter(address, min_times = 2)
+tidy(rec_token_jb)
+rec_token_jb %>% prep() %>% bake(new_data = NULL)
+# rec_token_jb %>% prep() %>% bake(new_data = mingxi_s_test)
+```
+
+```{r}
+recipe(~ address, data = mingxi_s_train) %>%
+  step_tokenize(address, custom_token = jieba_tokenizer) %>%
+  step_stopwords(address, stopword_source = "stopwords-iso", language = "zh") %>% 
+  step_tokenfilter(address, min_times = 2) %>% 
+  show_tokens(address) %>% 
+  .[1:5]
+```
+
+```{r}
+# 分词器要返回一个列表
+space_tokenizer <- function(x) {
+  strsplit(x, " +")
+}
+space_tokenizer("Sometimes you need to perform tokenization")
+class(space_tokenizer("Sometimes you need to perform tokenization"))
+```
+
+```{r}
+x <- "花都区花山镇省道福源村"
+jieba_worker <- worker(bylines = TRUE)
+x_seg <- segment(x, jiebar = jieba_worker)
+x_seg
+class(x_seg)
+tokenlist(x_seg)
+```
+
+
+# tidymodels建模全过程
+
+```{r}
+
+```
+
