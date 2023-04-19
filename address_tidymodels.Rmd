@@ -6,23 +6,28 @@ output: html_document
 ---
 
 # 载入库
+
 ```{r, message=FALSE, warning=FALSE}
 library(tidyverse)
 library(jiebaR)
-library(Rwordseg) # segmentCN的函数
+library(Rwordseg)
 library(readxl)
 library(tidytext)
 library(textrecipes)
 library(tidymodels)
+library(doParallel)
+library(tictoc)
 ```
 
 # 原始数据读取
+
 ```{r}
 mingxi <- read_xlsx("mingxi.xlsx")
 mingxi
 ```
 
 # 数据初步清理
+
 ```{r}
 remove_str <- "[(待删除)|(仅限续费)|(不可报装)|(未验收)|(已光改)|(地址)|(指定渠道下单)|(管道商协议问题)|(物业问题)|(光纤改造中，暂不可下单)]"
 mingxi_s <- 
@@ -48,6 +53,7 @@ mingxi_s
 
 安裝cidian包的使用方法：https://zhuanlan.zhihu.com/p/473619960
 使用cidian包的情况下，将字典通过decode_scel函数解压成单个txt格式词典，可以人工合并在一起，放入jieba的worker分词引擎中使用。
+
 ```{r}
 # tempdir() 
 # 设置字典文件，要先建立文件夹
@@ -62,6 +68,7 @@ listDict()
 ```
 
 # 使用tidymodels进行建模
+
 ```{r}
 # 划分数据集
 set.seed(100)
@@ -72,72 +79,135 @@ mingxi_s_train
 mingxi_s_test
 ```
 
-# 分单字
-
 # jieba分词
-
-```{r}
-jieba_worker  <-  worker(bylines = TRUE) # 结果为一个列表
-mingxi_s_train %>% 
-  mutate(address_seg_1 = segmentCN(address, analyzer = "jiebaR"), 
-         address_seg_2 = segment(address, jieba_worker))
-```
-
 
 ```{r}
 # 设定分词引擎
 jieba_tokenizer <- function(x) {
   jieba_worker = worker(
     bylines = TRUE, 
-    stop_word = "D:/K/DATA EXERCISE/R/zhaoqing_address/custom_dict/Rwordseg/stopwordsCN.txt", 
-    dict = "D:/K/DATA EXERCISE/R/zhaoqing_address/custom_dict/Rwordseg/user.dic"
+    stop_word = "./custom_dict/Rwordseg/stopwordsCN.txt", 
+    dict = "./custom_dict/Rwordseg/user.dic"
     ) # 结果为列表
   segment(x, jiebar = jieba_worker)
 }
+```
 
+
+```{r}
 # 使用自定义分词引擎
 rec_token_jb <- 
   recipe(class ~ ., data = mingxi_s_train) %>%
   update_role(id, new_role = "ID") %>% 
   step_tokenize(address, custom_token = jieba_tokenizer) %>% 
-  step_stopwords(address, stopword_source = "stopwords-iso", language = "zh") %>% 
-  step_tokenfilter(address, min_times = 2)
+  step_tokenfilter(address, min_times = 2) %>% 
+  step_tfidf(address) %>% 
+  step_normalize(all_numeric_predictors())
 tidy(rec_token_jb)
 rec_token_jb %>% prep() %>% bake(new_data = NULL)
 # rec_token_jb %>% prep() %>% bake(new_data = mingxi_s_test)
 ```
 
 ```{r}
-recipe(~ address, data = mingxi_s_train) %>%
-  step_tokenize(address, custom_token = jieba_tokenizer) %>%
-  step_stopwords(address, stopword_source = "stopwords-iso", language = "zh") %>% 
-  step_tokenfilter(address, min_times = 2) %>% 
-  show_tokens(address) %>% 
-  .[1:5]
+# 建立空模型
+model_null <- 
+  null_model() %>% 
+  set_engine("parsnip") %>% 
+  set_mode("classification")
+model_null
 ```
 
 ```{r}
-# 分词器要返回一个列表
-space_tokenizer <- function(x) {
-  strsplit(x, " +")
-}
-space_tokenizer("Sometimes you need to perform tokenization")
-class(space_tokenizer("Sometimes you need to perform tokenization"))
+# 建立模型
+model_rf <- 
+  rand_forest(trees = 100, mtry = 3) %>%
+  set_engine("ranger", seed = 100, num.threads = 12, verbose = TRUE) %>%
+  set_mode("classification")
+model_rf
 ```
 
 ```{r}
-x <- "花都区花山镇省道福源村"
-jieba_worker <- worker(bylines = TRUE)
-x_seg <- segment(x, jiebar = jieba_worker)
-x_seg
-class(x_seg)
-tokenlist(x_seg)
+# 建立工作流
+wf_null <- 
+  workflow() %>%
+  add_recipe(rec_token_jb) %>%
+  add_model(model_null)
+
+wf_rf <- 
+  workflow() %>%
+  add_recipe(rec_token_jb) %>%
+  add_model(model_rf)
 ```
 
 
-# tidymodels建模全过程
+```{r}
+# 模型拟合
+wf_null_fit <- wf_null %>% fit(mingxi_s_train)
+
+# 查看结果
+wf_null_fit %>% extract_fit_parsnip()
+
+# 预测测试集
+test_pred_truth <- 
+  bind_cols(
+    wf_null_fit %>% predict(mingxi_s_test) %>% select(.pred_class),
+    mingxi_s_test %>% select(class)
+) %>%
+  rename(truth = class,
+         pred = .pred_class)
+
+# 查看结果
+accuracy(data = test_pred_truth, truth = truth, estimate = pred)
+conf_mat(data = test_pred_truth, truth = truth, estimate = pred)
+```
 
 ```{r}
+# 模型拟合
+wf_rf_fit <- wf_rf %>% fit(mingxi_s_train)
 
+# 查看结果
+wf_rf_fit %>% extract_fit_parsnip()
+
+# 预测测试集
+test_pred_truth <- 
+  bind_cols(
+    wf_rf_fit %>% predict(mingxi_s_test) %>% select(.pred_class),
+    mingxi_s_test %>% select(class)
+) %>%
+  rename(truth = class,
+         pred = .pred_class)
+
+# 查看结果
+accuracy(data = test_pred_truth, truth = truth, estimate = pred)
+conf_mat(data = test_pred_truth, truth = truth, estimate = pred)
+```
+
+```{r}
+# 交叉检验设置
+set.seed(200)
+cv_5 <- vfold_cv(mingxi_s_train, v = 5)
+metric_acc <- metric_set(accuracy)
+```
+
+
+```{r}
+# 设定并行集群
+cl <- makeCluster(10)
+registerDoParallel(cl)
+tic()
+wf_rf_cv_5 <- 
+  wf_rf %>% 
+  fit_resamples(
+    resamples = cv_5, 
+    metrics = metric_acc, 
+    control = control_resamples(parallel_over = NULL)
+    )
+toc()
+stopCluster(cl)
+```
+
+```{r}
+wf_rf_cv_3
+wf_rf_cv_3 %>% collect_metrics()
 ```
 
