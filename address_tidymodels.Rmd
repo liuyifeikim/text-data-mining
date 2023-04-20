@@ -17,6 +17,7 @@ library(textrecipes)
 library(tidymodels)
 library(doParallel)
 library(tictoc)
+library(discrim)
 ```
 
 # 原始数据读取
@@ -93,19 +94,29 @@ jieba_tokenizer <- function(x) {
 }
 ```
 
+# 建立预处理流程
 
 ```{r}
 # 使用自定义分词引擎
-rec_token_jb <- 
+rec_token_jb_tfidf <- 
   recipe(class ~ ., data = mingxi_s_train) %>%
   update_role(id, new_role = "ID") %>% 
   step_tokenize(address, custom_token = jieba_tokenizer) %>% 
-  step_tokenfilter(address, min_times = 2) %>% 
+  step_tokenfilter(address, max_tokens = 100) %>% 
   step_tfidf(address) %>% 
   step_normalize(all_numeric_predictors())
-tidy(rec_token_jb)
-rec_token_jb %>% prep() %>% bake(new_data = NULL)
-# rec_token_jb %>% prep() %>% bake(new_data = mingxi_s_test)
+rec_token_jb_tfidf %>% prep() %>% bake(new_data = NULL)
+rec_token_jb_tfidf %>% prep() %>% bake(new_data = mingxi_s_test)
+
+# 哑变量
+rec_token_jb_dummy <-
+  recipe(class ~ ., data = mingxi_s_train) %>%
+  update_role(id, new_role = "ID") %>%
+  step_tokenize(address, custom_token = jieba_tokenizer) %>%
+  step_tokenfilter(address, max_tokens = 100) %>%
+  step_tf(address, weight_scheme = "binary")
+rec_token_jb_dummy %>% prep() %>% bake(new_data = NULL)
+rec_token_jb_dummy %>% prep() %>% bake(new_data = mingxi_s_test)
 ```
 
 ```{r}
@@ -115,39 +126,43 @@ model_null <-
   set_engine("parsnip") %>% 
   set_mode("classification")
 model_null
-```
 
-```{r}
-# 建立模型
+# 建立随机森林模型
 model_rf <- 
   rand_forest(trees = 100, mtry = 3) %>%
   set_engine("ranger", seed = 100, num.threads = 12, verbose = TRUE) %>%
   set_mode("classification")
 model_rf
+
+# 贝叶斯模型
+model_nb <- naive_Bayes(Laplace = 0.1) %>%
+  set_mode("classification") %>%
+  set_engine("naivebayes")
+model_nb
 ```
 
 ```{r}
 # 建立工作流
 wf_null <- 
   workflow() %>%
-  add_recipe(rec_token_jb) %>%
+  add_recipe(rec_token_jb_tfidf) %>%
   add_model(model_null)
 
 wf_rf <- 
   workflow() %>%
-  add_recipe(rec_token_jb) %>%
+  add_recipe(rec_token_jb_tfidf) %>%
   add_model(model_rf)
+
+wf_nb <- 
+  workflow() %>%
+  add_recipe(rec_token_jb_dummy) %>%
+  add_model(model_nb)
 ```
 
 
 ```{r}
-# 模型拟合
+# 空模型效果
 wf_null_fit <- wf_null %>% fit(mingxi_s_train)
-
-# 查看结果
-wf_null_fit %>% extract_fit_parsnip()
-
-# 预测测试集
 test_pred_truth <- 
   bind_cols(
     wf_null_fit %>% predict(mingxi_s_test) %>% select(.pred_class),
@@ -155,20 +170,13 @@ test_pred_truth <-
 ) %>%
   rename(truth = class,
          pred = .pred_class)
-
-# 查看结果
 accuracy(data = test_pred_truth, truth = truth, estimate = pred)
 conf_mat(data = test_pred_truth, truth = truth, estimate = pred)
 ```
 
 ```{r}
-# 模型拟合
+# 随机森林效果
 wf_rf_fit <- wf_rf %>% fit(mingxi_s_train)
-
-# 查看结果
-wf_rf_fit %>% extract_fit_parsnip()
-
-# 预测测试集
 test_pred_truth <- 
   bind_cols(
     wf_rf_fit %>% predict(mingxi_s_test) %>% select(.pred_class),
@@ -176,16 +184,30 @@ test_pred_truth <-
 ) %>%
   rename(truth = class,
          pred = .pred_class)
-
-# 查看结果
 accuracy(data = test_pred_truth, truth = truth, estimate = pred)
 conf_mat(data = test_pred_truth, truth = truth, estimate = pred)
 ```
 
 ```{r}
+# 贝叶斯效果
+wf_nb_fit <- wf_nb %>% fit(mingxi_s_train)
+test_pred_truth <- 
+  bind_cols(
+    wf_nb_fit %>% predict(mingxi_s_test) %>% select(.pred_class),
+    mingxi_s_test %>% select(class)
+) %>%
+  rename(truth = class,
+         pred = .pred_class)
+accuracy(data = test_pred_truth, truth = truth, estimate = pred)
+conf_mat(data = test_pred_truth, truth = truth, estimate = pred)
+```
+
+# K折交叉验证
+
+```{r}
 # 交叉检验设置
-set.seed(200)
-cv_5 <- vfold_cv(mingxi_s_train, v = 5)
+set.seed(100)
+cv_5 <- vfold_cv(mingxi_s_train, v = 5, strata = class)
 metric_acc <- metric_set(accuracy)
 ```
 
@@ -200,14 +222,29 @@ wf_rf_cv_5 <-
   fit_resamples(
     resamples = cv_5, 
     metrics = metric_acc, 
-    control = control_resamples(parallel_over = NULL)
+    control = control_resamples(parallel_over = "everything")
     )
 toc()
 stopCluster(cl)
+wf_rf_cv_5 %>% unnest(.notes)
+wf_rf_cv_5 %>% collect_metrics()
 ```
 
 ```{r}
-wf_rf_cv_3
-wf_rf_cv_3 %>% collect_metrics()
+# 设定并行集群
+cl <- makeCluster(10)
+registerDoParallel(cl)
+tic()
+wf_nb_cv_5 <- 
+  wf_nb %>% 
+  fit_resamples(
+    resamples = cv_5, 
+    metrics = metric_acc, 
+    control = control_resamples(parallel_over = "everything")
+    )
+toc()
+stopCluster(cl)
+wf_nb_cv_5 %>% unnest(.notes)
+wf_nb_cv_5 %>% collect_metrics()
 ```
 
