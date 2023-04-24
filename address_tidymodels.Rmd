@@ -72,10 +72,10 @@ listDict()
 
 ```{r}
 # 划分数据集
-set.seed(100)
+set.seed(200)
 mingxi_s_split <- initial_split(mingxi_s, prop = 0.80, strata = class)
 mingxi_s_train <- training(mingxi_s_split)
-mingxi_s_test  <-  testing(mingxi_s_split)
+mingxi_s_test  <- testing(mingxi_s_split)
 mingxi_s_train
 mingxi_s_test
 ```
@@ -206,45 +206,82 @@ conf_mat(data = test_pred_truth, truth = truth, estimate = pred)
 
 ```{r}
 # 交叉检验设置
-set.seed(100)
+set.seed(200)
 cv_5 <- vfold_cv(mingxi_s_train, v = 5, strata = class)
 metric_acc <- metric_set(accuracy)
-```
 
-
-```{r}
-# 设定并行集群
-cl <- makeCluster(10)
-registerDoParallel(cl)
+# 并行计算会报错
+# cl <- makeCluster(10)
+# registerDoParallel(cl)
 tic()
 wf_rf_cv_5 <- 
   wf_rf %>% 
   fit_resamples(
     resamples = cv_5, 
-    metrics = metric_acc, 
+    metrics = metric_acc,
     control = control_resamples(parallel_over = "everything")
     )
 toc()
-stopCluster(cl)
+# stopCluster(cl)
 wf_rf_cv_5 %>% unnest(.notes)
 wf_rf_cv_5 %>% collect_metrics()
 ```
 
+# textrecipes
+
 ```{r}
-# 设定并行集群
-cl <- makeCluster(10)
-registerDoParallel(cl)
-tic()
-wf_nb_cv_5 <- 
-  wf_nb %>% 
-  fit_resamples(
-    resamples = cv_5, 
-    metrics = metric_acc, 
-    control = control_resamples(parallel_over = "everything")
-    )
-toc()
-stopCluster(cl)
-wf_nb_cv_5 %>% unnest(.notes)
-wf_nb_cv_5 %>% collect_metrics()
+library(recipes)
+library(modeldata)
+data(Smithsonian)
+smith_tr <- Smithsonian[1:15, ]
+smith_te <- Smithsonian[16:20, ]
+rec <- recipe(~., data = smith_tr)
+rec <- rec %>%
+step_clean_levels(name)
+rec <- prep(rec, training = smith_tr)
+cleaned <- bake(rec, smith_tr)
+tidy(rec, number = 1)
+```
+
+```{r}
+library(recipes)
+data(airquality)
+air_tr <- tibble(airquality[1:100, ])
+air_te <- tibble(airquality[101:153, ])
+rec <- recipe(~., data = air_tr)
+rec <- rec %>%
+step_clean_names(all_predictors())
+rec <- prep(rec, training = air_tr)
+tidy(rec, number = 1)
+bake(rec, air_tr)
+bake(rec, air_te)
+```
+
+```{r}
+library(recipes)
+library(modeldata)
+data(grants)
+grants_rec <- recipe(~sponsor_code, data = grants_other) %>% step_dummy_hash(sponsor_code)
+grants_obj <- grants_rec %>% prep()
+bake(grants_obj, grants_test)
+tidy(grants_rec, number = 1)
+tidy(grants_obj, number = 1)
+```
+
+```{r}
+library(recipes)
+library(modeldata)
+data(tate_text)
+tate_rec <- recipe(~., data = tate_text) %>% 
+  step_tokenize(medium) %>%
+  step_lda(medium)
+tate_obj <- tate_rec %>% prep()
+bake(tate_obj, new_data = NULL) %>% slice(1:2)
+tidy(tate_rec, number = 2)
+tidy(tate_obj, number = 2)
+# Changing the number of topics.
+recipe(~., data = tate_text) %>%
+step_tokenize(medium, artist) %>%
+step_lda(medium, artist, num_topics = 20) %>% prep() %>% bake(new_data = NULL) %>% slice(1:2)
 ```
 
